@@ -10,9 +10,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 
 import torch
 import torch.distributed as dist
-# from download import find_model
 from models.fcdm_models import FCDM_models
-from models.diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from tqdm import tqdm
 import os

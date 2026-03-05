@@ -90,7 +90,7 @@ class LabelEmbedder(nn.Module):
         return embeddings
 
 #################################################################################
-#                                 Core DiU Model                                #
+#                                Core FCDM Model                                #
 #################################################################################
 
 class GRN(nn.Module):
@@ -115,11 +115,11 @@ class ConvNeXtBlock(nn.Module):
         super().__init__()        
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
 
-        self.norm = LayerNorm2d(dim, affine=False, eps=1e-6) #nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.pwconv1 = nn.Conv2d(dim, int(dim * mlp_ratio), 1) #nn.Linear(dim, int(dim * mlp_ratio))
+        self.norm = LayerNorm2d(dim, affine=False, eps=1e-6)
+        self.pwconv1 = nn.Conv2d(dim, int(dim * mlp_ratio), 1)
         self.act = nn.GELU()
         self.grn = GRN(int(dim * mlp_ratio))
-        self.pwconv2 = nn.Conv2d(int(dim * mlp_ratio), dim, 1) #nn.Linear(int(dim * mlp_ratio), dim)
+        self.pwconv2 = nn.Conv2d(int(dim * mlp_ratio), dim, 1)
 
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -132,12 +132,12 @@ class ConvNeXtBlock(nn.Module):
         c: conditioning tensor of shape (B, C)
         """
         # Depthwise conv
-        h = self.dwconv(x)  # (B, C, H, W)
+        h = self.dwconv(x)
         # Compute adaLN parameters
         shift, scale, gate = self.adaLN_modulation(c).unsqueeze(2).unsqueeze(3).chunk(3, dim=1)
         # Apply adaptive LayerNorm-Zero: norm -> scale & shift
         h = self.norm(h)
-        h = torch.addcmul(shift, h, scale + 1) #h * (scale[:, None, None, :] + 1) + shift[:, None, None, :]
+        h = torch.addcmul(shift, h, scale + 1)
         # Pointwise MLP
         h = self.pwconv1(h)
         h = self.act(h)
@@ -171,7 +171,7 @@ class Downsample(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.conv = nn.Sequential(nn.Conv2d(in_ch, out_ch // 4, kernel_size=3, stride=1, padding=1, bias=False),
-                                  nn.PixelUnshuffle(2))#nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1)
+                                  nn.PixelUnshuffle(2))
 
     def forward(self, x):
         return self.conv(x)
@@ -180,12 +180,10 @@ class Downsample(nn.Module):
 class Upsample(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
-        # self.up   = nn.Upsample(scale_factor=2, mode='nearest')
         self.conv = nn.Sequential(nn.Conv2d(in_ch, out_ch * 4, kernel_size=3, stride=1, padding=1, bias=False),
-                                  nn.PixelShuffle(2))#nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+                                  nn.PixelShuffle(2))
 
     def forward(self, x):
-        # x = self.up(x)
         return self.conv(x)
 
 
@@ -218,7 +216,7 @@ class FCDM(nn.Module):
         self.t_embedder_3 = TimestepEmbedder(hidden_size*4)
         self.y_embedder_3 = LabelEmbedder(num_classes, hidden_size*4, class_dropout_prob)
 
-        self.x_embedder = nn.Conv2d(in_channels, hidden_size, kernel_size=3, stride=1, padding=1) #nn.Conv2d(in_channels, hidden_size, kernel_size=1)
+        self.x_embedder = nn.Conv2d(in_channels, hidden_size, kernel_size=3, stride=1, padding=1)
 
         # encoder-1
         self.encoder_level_1 = nn.ModuleList()

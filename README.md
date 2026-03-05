@@ -63,7 +63,7 @@ Once cached, you can pass the Zarr path to any script using: `--zarr-path /path/
 Run the following command to train FCDM on your precomputed latents:
   ```bash
   accelerate launch --mixed_precision bf16 --num_processes 4 train_gen/train.py \
-    --model ACD-XL \
+    --model FCDM-XL \
     --label-path /path/to/labels \
     --feature-path /path/to/features \
     --results-dir results
@@ -79,7 +79,7 @@ Run the following command to train FCDM on your precomputed latents:
 Generate 50,000 samples for evaluation. This script will automatically save the generated images and a corresponding `.npz` file.
   ```bash
 torchrun --nnodes=1 --nproc_per_node=4 train_gen/sample_ddp.py \
-    --model ADC-XL \
+    --model FCDM-XL \
     --num-fid-samples 50000 \
     --ckpt /path/to/checkpoint \
     --sample-dir samples \
