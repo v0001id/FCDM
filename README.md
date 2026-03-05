@@ -1,11 +1,17 @@
-# Diffusion Models with ConvNeXt (FCDM)
-<p align="left">
-  <b>Official PyTorch Implementation</b>
-</p>
+# Diffusion Models with ConvNeXt (FCDM)<br><sub>Official PyTorch Implementation</sub>
 
 ![FCDM samples](visuals/visual.jpg)
 
 This repository contains the PyTorch implementation (training, sampling, and model definitions) for **FCDM**, a paper exploring diffusion models with the ConvNeXt architecture. It supports both local and distributed (cluster) environments.
+
+> **[CVPR 2026] Reviving ConvNeXt for Efficient Convolutional Diffusion Models**<br>
+> Taesung Kwon, Lorenzo Bianchi, Lennart Wittke, Felix Watine, Fabio Carrara, Jong Chul Ye, Romann M. Weber, Vinicius C. Azevedo
+> <br>KAIST, ETH Zürich, ISTI-CNR, University of Pisa<br>
+
+Here we introduce the fully convolutional diffusion model (FCDM), a model having a backbone similar to ConvNeXt, but designed for conditional diffusion modeling.
+We find that using only 50% of the FLOPs of DiT-XL/2, FCDM-XL achieves competitive performance with 7× and 7.5× fewer training steps at 256×256 and 512×512 resolutions, respectively.
+Remarkably, FCDM-XL can be trained on a 4-GPU system, highlighting the exceptional training efficiency of our architecture.
+Our results demonstrate that modern convolutional designs provide a competitive and highly efficient alternative for scaling diffusion models, reviving ConvNeXt as a simple yet powerful building block for efficient generative modeling.
 
 ---
 
