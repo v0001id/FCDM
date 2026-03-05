@@ -107,7 +107,7 @@ Run the evaluation:
 We thank Farnood Salehi, Jingwei Tang, and Jakob Buhmann for helpful discussions. 
 Taesung Kwon is supported by the NRF Sejong Science Fellowship.
 
-This codebase borrows from existing diffusion repositories, most notably Meta's [DiT](https://github.com/facebookresearch/DiT) and OpenAI's [ADM](https://github.com/openai/guided-diffusion).
+This codebase borrows from existing diffusion repositories, most notably Meta's [DiT](https://github.com/facebookresearch/DiT) and its improved implementation [fastDiT](https://github.com/chuanyangjin/fast-DiT), and OpenAI's [ADM](https://github.com/openai/guided-diffusion).
 
 ## License
 The codes are licensed under CC-BY-NC. See [`LICENSE.txt`](LICENSE.txt) for details.
