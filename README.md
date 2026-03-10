@@ -28,6 +28,9 @@ conda activate fcdm
 
 > 💡 **Note:** Some cluster environments restrict outgoing internet connections due to security policies, preventing automatic model downloads from Hugging Face. If you are in such an environment, follow these steps to manually download and transfer the SD-VAE (or EQVAE) snapshot.
 
+<details>
+<summary>✅ <b>Click to see manual download & transfer steps</b></summary>
+
 **1. Download the snapshot locally:** Run the script below on your local machine. This creates a folder (e.g., `sd-vae-ft-ema/`) containing the necessary model files (`config.json`, `pytorch_model.bin`, etc.).
   ```bash
   python preparation/download_snapshot.py
@@ -43,6 +46,8 @@ scp -r sd-vae-ft-ema/ user@your_cluster_address:/path/to/your_cluster_dir/
 python your_script.py --hf-model-dir /path/to/your_cluster_dir/sd-vae-ft-ema
 ```
 
+</details>
+  
 ---
 
 ## 🗂 2. Data Preparation
