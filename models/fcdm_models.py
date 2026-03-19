@@ -17,7 +17,7 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(-1).unsqueeze(-1)) + shift.unsqueeze(-1).unsqueeze(-1)
 
 #################################################################################
-#               Embedding Layers for Timesteps and Class Labels                 #
+#               Embedding Layers for Timesteps and Text Conditioning            #
 #################################################################################
 
 class TimestepEmbedder(nn.Module):
@@ -60,34 +60,32 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-class LabelEmbedder(nn.Module):
+class TextConditionProjector(nn.Module):
     """
-    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
+    Projects text encoder hidden states to model conditioning widths.
+    Includes conditioning dropout for classifier-free guidance.
     """
-    def __init__(self, num_classes, hidden_size, dropout_prob):
+    def __init__(self, text_embed_dim, hidden_size, dropout_prob):
         super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
-        self.num_classes = num_classes
+        self.proj = nn.Linear(text_embed_dim, hidden_size)
         self.dropout_prob = dropout_prob
 
-    def token_drop(self, labels, force_drop_ids=None):
-        """
-        Drops labels to enable classifier-free guidance.
-        """
-        if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
-        else:
-            drop_ids = force_drop_ids == 1
-        labels = torch.where(drop_ids, self.num_classes, labels)
-        return labels
+    def forward(self, text_embeddings, train=True, force_drop_ids=None):
+        if text_embeddings.dim() != 2:
+            raise ValueError(f"Expected text_embeddings with shape [B, D], got {text_embeddings.shape}")
 
-    def forward(self, labels, train, force_drop_ids=None):
-        use_dropout = self.dropout_prob > 0
-        if (train and use_dropout) or (force_drop_ids is not None):
-            labels = self.token_drop(labels, force_drop_ids)
-        embeddings = self.embedding_table(labels)
-        return embeddings
+        if (train and self.dropout_prob > 0) or (force_drop_ids is not None):
+            if force_drop_ids is None:
+                drop_ids = (torch.rand(text_embeddings.shape[0], device=text_embeddings.device) < self.dropout_prob)
+            else:
+                drop_ids = force_drop_ids == 1
+            text_embeddings = torch.where(
+                drop_ids.unsqueeze(-1),
+                torch.zeros_like(text_embeddings),
+                text_embeddings,
+            )
+
+        return self.proj(text_embeddings)
 
 #################################################################################
 #                                Core FCDM Model                                #
@@ -198,7 +196,7 @@ class FCDM(nn.Module):
         depth=[2,5,8,5,2],
         mlp_ratio=3,
         class_dropout_prob=0.1,
-        num_classes=1000,
+        text_embed_dim=768,
         learn_sigma=True,
         **kwargs
     ):
@@ -208,13 +206,13 @@ class FCDM(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         
         self.t_embedder_1 = TimestepEmbedder(hidden_size)
-        self.y_embedder_1 = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.y_embedder_1 = TextConditionProjector(text_embed_dim, hidden_size, class_dropout_prob)
 
         self.t_embedder_2 = TimestepEmbedder(hidden_size*2)
-        self.y_embedder_2 = LabelEmbedder(num_classes, hidden_size*2, class_dropout_prob)
+        self.y_embedder_2 = TextConditionProjector(text_embed_dim, hidden_size*2, class_dropout_prob)
 
         self.t_embedder_3 = TimestepEmbedder(hidden_size*4)
-        self.y_embedder_3 = LabelEmbedder(num_classes, hidden_size*4, class_dropout_prob)
+        self.y_embedder_3 = TextConditionProjector(text_embed_dim, hidden_size*4, class_dropout_prob)
 
         self.x_embedder = nn.Conv2d(in_channels, hidden_size, kernel_size=3, stride=1, padding=1)
 
@@ -267,10 +265,13 @@ class FCDM(nn.Module):
         nn.init.xavier_uniform_(w.view(w.shape[0], -1))
         nn.init.constant_(self.x_embedder.bias, 0)
 
-        # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder_1.embedding_table.weight, std=0.02)
-        nn.init.normal_(self.y_embedder_2.embedding_table.weight, std=0.02)
-        nn.init.normal_(self.y_embedder_3.embedding_table.weight, std=0.02)
+        # Initialize text conditioning projection layers:
+        nn.init.normal_(self.y_embedder_1.proj.weight, std=0.02)
+        nn.init.normal_(self.y_embedder_2.proj.weight, std=0.02)
+        nn.init.normal_(self.y_embedder_3.proj.weight, std=0.02)
+        nn.init.constant_(self.y_embedder_1.proj.bias, 0)
+        nn.init.constant_(self.y_embedder_2.proj.bias, 0)
+        nn.init.constant_(self.y_embedder_3.proj.bias, 0)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder_1.mlp[0].weight, std=0.02)
@@ -301,24 +302,24 @@ class FCDM(nn.Module):
             return outputs
         return ckpt_forward
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, text_embeddings):
         """
         Forward pass of U-DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
+        text_embeddings: (N, D) pooled embeddings from a text encoder
         """
         x_emb = self.x_embedder(x)
         t1 = self.t_embedder_1(t)
-        y1 = self.y_embedder_1(y, self.training)
+        y1 = self.y_embedder_1(text_embeddings, self.training)
         c1 = t1 + y1
 
         t2 = self.t_embedder_2(t)
-        y2 = self.y_embedder_2(y, self.training)
+        y2 = self.y_embedder_2(text_embeddings, self.training)
         c2 = t2 + y2
 
         t3 = self.t_embedder_3(t)
-        y3 = self.y_embedder_3(y, self.training)
+        y3 = self.y_embedder_3(text_embeddings, self.training)
         c3 = t3 + y3
 
         # encoder_1
@@ -358,14 +359,14 @@ class FCDM(nn.Module):
 
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t, text_embeddings, cfg_scale):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
+        model_out = self.forward(combined, t, text_embeddings)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.

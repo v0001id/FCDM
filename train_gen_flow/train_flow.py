@@ -9,11 +9,7 @@ import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from torchvision.datasets import ImageFolder
 from torchvision import transforms
 import numpy as np
 from collections import OrderedDict
@@ -28,6 +24,9 @@ from models.fcdm_models import FCDM_models
 
 from diffusers.models import AutoencoderKL
 from torchvision.utils import save_image
+from transformers import AutoModel, AutoTokenizer
+from datasets import load_dataset
+import wandb
 
 from flow_matching import create_transport, Sampler
 from train_utils import parse_transport_args, parse_sde_args
@@ -142,6 +141,26 @@ def custom_to_pil(x):
         x = x.convert("RGB")
     return x
 
+
+class HuggingFaceImageTextDataset(Dataset):
+    def __init__(self, dataset_name, split="train", image_column="image", text_column="text", dataset_config_name=None):
+        self.dataset = load_dataset(dataset_name, dataset_config_name, split=split)
+        self.image_column = image_column
+        self.text_column = text_column
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        image = item[self.image_column]
+        if not isinstance(image, Image.Image):
+            image = Image.fromarray(np.array(image))
+        text = item[self.text_column]
+        if text is None:
+            text = ""
+        return image, str(text)
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -181,6 +200,8 @@ def main(args):
     latent_size = args.image_size // 8
     model = FCDM_models[args.model](
         in_channels=args.in_channels,
+        text_embed_dim=args.text_embed_dim,
+        class_dropout_prob=args.class_dropout_prob,
         learn_sigma=False
     )
     # Note that parameter initialization is done within the FCDM constructor
@@ -203,6 +224,13 @@ def main(args):
         ).to(device)
     else:
         vae = AutoencoderKL.from_pretrained(args.hf_model_name).to(device)
+    vae.eval()
+    requires_grad(vae, False)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.text_encoder_name)
+    text_encoder = AutoModel.from_pretrained(args.text_encoder_name).to(device)
+    text_encoder.eval()
+    requires_grad(text_encoder, False)
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
@@ -222,13 +250,23 @@ def main(args):
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
 
     # Setup data:
-    features_dir = f"{args.feature_path}"
-    labels_dir = f"{args.label_path}"
-    if args.zarr_path is not None:
-        zarr_dir = f"{args.zarr_path}"
-        dataset = ZarrCustomDataset(zarr_dir)
-    else:
-        dataset = CustomDataset(features_dir, labels_dir)
+    if args.dataset_name is None:
+        raise ValueError("--dataset-name is required for text-conditioned training.")
+
+    dataset = HuggingFaceImageTextDataset(
+        dataset_name=args.dataset_name,
+        split=args.dataset_split,
+        image_column=args.dataset_image_column,
+        text_column=args.dataset_text_column,
+        dataset_config_name=args.dataset_config_name,
+    )
+    sample_prompts = [dataset[i][1] for i in range(min(len(dataset), args.prompt_pool_size)) if dataset[i][1].strip()]
+    train_transform = transforms.Compose([
+        transforms.Lambda(lambda img: center_crop_arr(img, args.image_size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], inplace=True)
+    ])
     loader = DataLoader(
         dataset,
         batch_size=int(args.global_batch_size // accelerator.num_processes),
@@ -238,7 +276,15 @@ def main(args):
         drop_last=True
     )
     if accelerator.is_main_process:
-        logger.info(f"Dataset contains {len(dataset):,} images ({args.feature_path})")
+        logger.info(f"Dataset contains {len(dataset):,} samples")
+
+    if accelerator.is_main_process and args.use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args),
+            dir=experiment_dir,
+        )
 
     # Prepare models for training:
     if args.ckpt is None:
@@ -258,12 +304,24 @@ def main(args):
     for epoch in range(args.epochs):
         if accelerator.is_main_process:
             logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-            x = x.squeeze(dim=1)
-            y = y.squeeze(dim=1)
-            model_kwargs = dict(y=y)
+        for batch in loader:
+            images, texts = batch
+            pixel_values = torch.stack([train_transform(img.convert("RGB")) for img in images]).to(device)
+            with torch.no_grad():
+                latents = vae.encode(pixel_values).latent_dist.sample() * args.vae_scaling_factor
+                tokens = tokenizer(
+                    list(texts),
+                    padding=True,
+                    truncation=True,
+                    max_length=args.max_text_length,
+                    return_tensors="pt",
+                )
+                tokens = {k: v.to(device) for k, v in tokens.items()}
+                text_outputs = text_encoder(**tokens)
+                text_embeddings = text_outputs.last_hidden_state.mean(dim=1)
+            x = latents
+            model_kwargs = dict(text_embeddings=text_embeddings)
+
             loss_dict = transport.training_losses(model, x, model_kwargs)
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
@@ -285,6 +343,8 @@ def main(args):
                 avg_loss = avg_loss.item() / accelerator.num_processes
                 if accelerator.is_main_process:
                     logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                    if args.use_wandb:
+                        wandb.log({"train/loss": avg_loss, "train/steps_per_sec": steps_per_sec}, step=train_steps)
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -295,7 +355,7 @@ def main(args):
                 if accelerator.is_main_process:
                     # Save checkpoint
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        "model": accelerator.unwrap_model(model).state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args
@@ -305,24 +365,37 @@ def main(args):
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
 
                     # Generate and save samples
-                    class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
                     gen = torch.Generator(device=device).manual_seed(42)
                     with torch.no_grad():
-                        # Sample inputs:
-                        n = len(class_labels)
+                        if sample_prompts:
+                            n = min(4, len(sample_prompts))
+                            eval_prompts = np.random.choice(sample_prompts, size=n, replace=False).tolist()
+                        else:
+                            n = 4
+                            eval_prompts = ["a high-quality photo"] * n
+
                         latent_size = args.image_size // 8
                         z = torch.randn((n, 4, latent_size, latent_size), generator=gen, device=device)
-                        y = torch.tensor(class_labels, device=device)
+                        tokenized = tokenizer(
+                            eval_prompts,
+                            padding=True,
+                            truncation=True,
+                            max_length=args.max_text_length,
+                            return_tensors="pt",
+                        )
+                        tokenized = {k: v.to(device) for k, v in tokenized.items()}
+                        text_outputs = text_encoder(**tokenized)
+                        text_embeddings = text_outputs.last_hidden_state.mean(dim=1)
 
                          # Setup classifier-free guidance:
                         if args.cfg_scale > 1.0:
                             z = torch.cat([z, z], 0)
-                            y_null = torch.tensor([1000] * n, device=device)
-                            y = torch.cat([y, y_null], 0)
-                            sample_model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+                            null_embeddings = torch.zeros_like(text_embeddings)
+                            text_embeddings = torch.cat([text_embeddings, null_embeddings], 0)
+                            sample_model_kwargs = dict(text_embeddings=text_embeddings, cfg_scale=args.cfg_scale)
                             model_fn = ema.forward_with_cfg
                         else:
-                            sample_model_kwargs = dict(y=y)
+                            sample_model_kwargs = dict(text_embeddings=text_embeddings)
                             model_fn = ema.forward
 
                         start_time = time()
@@ -333,17 +406,29 @@ def main(args):
 
                         if args.cfg_scale > 1.0:
                             samples, _ = samples.chunk(2, dim=0)
-                        samples = vae.decode(samples / 0.18215).sample
+                        samples = vae.decode(samples / args.vae_scaling_factor).sample
 
-                    logger.info(f"Sampling {len(class_labels)} images took {sampling_time:.2f} seconds")
-                    save_image(samples, f"{sample_dir}/{train_steps:07d}.png", nrow=len(class_labels)//2, normalize=True, value_range=(-1, 1))
+                    logger.info(f"Sampling {len(eval_prompts)} images took {sampling_time:.2f} seconds")
+                    sample_path = f"{sample_dir}/{train_steps:07d}.png"
+                    save_image(samples, sample_path, nrow=max(1, len(eval_prompts)//2), normalize=True, value_range=(-1, 1))
                     logger.info(f"Generated samples at step {train_steps}")
+
+                    if args.use_wandb:
+                        wandb.log(
+                            {
+                                "eval/samples": [wandb.Image(custom_to_pil(img), caption=prompt) for img, prompt in zip(samples, eval_prompts)],
+                                "eval/prompts": eval_prompts,
+                            },
+                            step=train_steps,
+                        )
 
             if train_steps > args.max_train_steps:
                 break
     
     if accelerator.is_main_process:
         logger.info("Done!")
+        if args.use_wandb:
+            wandb.finish()
 
 
 if __name__ == "__main__":
@@ -352,13 +437,22 @@ if __name__ == "__main__":
     parser.add_argument("--feature-path", type=str, default="features")
     parser.add_argument("--label-path", type=str, default="labels")
     parser.add_argument("--zarr-path", type=str, default=None)
+    parser.add_argument("--dataset-name", type=str, default=None)
+    parser.add_argument("--dataset-config-name", type=str, default=None)
+    parser.add_argument("--dataset-split", type=str, default="train")
+    parser.add_argument("--dataset-image-column", type=str, default="image")
+    parser.add_argument("--dataset-text-column", type=str, default="text")
+    parser.add_argument("--prompt-pool-size", type=int, default=2048)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--in-channels", type=int, default=4)
     parser.add_argument("--ckpt", type=str, default=None)
-    parser.add_argument("--max-train-steps", type=str, default=1_000_000)
+    parser.add_argument("--max-train-steps", type=int, default=1_000_000)
     parser.add_argument("--model", type=str, choices=list(FCDM_models.keys()), default="FCDM-XL")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--class-dropout-prob", type=float, default=0.1)
+    parser.add_argument("--text-encoder-name", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
+    parser.add_argument("--text-embed-dim", type=int, default=384)
+    parser.add_argument("--max-text-length", type=int, default=77)
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
@@ -371,6 +465,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=32)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--use-wandb", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--wandb-project", type=str, default="fcdm-text-flow")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
 
     parse_transport_args(parser)
     parse_sde_args(parser)
