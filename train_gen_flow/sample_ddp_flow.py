@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 from models.fcdm_models import FCDM_models
 from diffusers.models import AutoencoderKL
+from transformers import AutoModel, AutoTokenizer
 from tqdm import tqdm
 import os
 from PIL import Image
@@ -84,8 +85,9 @@ def main(args):
     # Load model:
     latent_size = args.image_size // 8
     model = FCDM_models[args.model](
-        num_classes=args.num_classes,
         in_channels=args.in_channels,
+        text_embed_dim=args.text_embed_dim,
+        class_dropout_prob=args.class_dropout_prob,
         learn_sigma=False
     ).to(device)
     # Load a pre-trained checkpoint:
@@ -118,6 +120,10 @@ def main(args):
         ).to(device)
     else:
         vae = AutoencoderKL.from_pretrained(args.hf_model_name).to(device)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.text_encoder_name)
+    text_encoder = AutoModel.from_pretrained(args.text_encoder_name).to(device)
+    text_encoder.eval()
 
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
     using_cfg = args.cfg_scale > 1.0
@@ -159,17 +165,28 @@ def main(args):
     for _ in pbar:
         # Sample inputs:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
-        y = torch.randint(0, args.num_classes, (n,), device=device)
+        prompts = [args.default_prompt] * n
+        tokenized = tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=args.max_text_length,
+            return_tensors="pt",
+        )
+        tokenized = {k: v.to(device) for k, v in tokenized.items()}
+        with torch.no_grad():
+            text_outputs = text_encoder(**tokenized)
+            text_embeddings = text_outputs.last_hidden_state.mean(dim=1)
 
         # Setup classifier-free guidance:
         if using_cfg:
             z = torch.cat([z, z], 0)
-            y_null = torch.tensor([1000] * n, device=device)
-            y = torch.cat([y, y_null], 0)
-            model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+            null_embeddings = torch.zeros_like(text_embeddings)
+            text_embeddings = torch.cat([text_embeddings, null_embeddings], 0)
+            model_kwargs = dict(text_embeddings=text_embeddings, cfg_scale=args.cfg_scale)
             model_fn = model.forward_with_cfg
         else:
-            model_kwargs = dict(y=y)
+            model_kwargs = dict(text_embeddings=text_embeddings)
             model_fn = model.forward
 
         # Sample images:
@@ -211,7 +228,11 @@ if __name__ == "__main__":
     parser.add_argument("--hf-model-dir", type=str, default=None)
     parser.add_argument("--in-channels", type=int, default=4)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--text-encoder-name", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
+    parser.add_argument("--text-embed-dim", type=int, default=384)
+    parser.add_argument("--class-dropout-prob", type=float, default=0.1)
+    parser.add_argument("--max-text-length", type=int, default=77)
+    parser.add_argument("--default-prompt", type=str, default="a high-quality photo")
     parser.add_argument("--num-fid-samples", type=int, default=50000)
     parser.add_argument("--cfg-scale",  type=float, default=1.5)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
